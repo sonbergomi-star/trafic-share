@@ -1,164 +1,164 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
-from pydantic import BaseModel
-from datetime import date
+from datetime import datetime, date
+from typing import Optional
+import logging
 
 from app.core.database import get_db
-from app.core.config import settings
+from app.middleware.auth import verify_admin
 from app.models.user import User
-from app.models.session import Session
-from app.models.transaction import Transaction, WithdrawRequest
-from app.models.pricing import DailyPrice
-from app.models.announcement import Announcement
+from app.services.admin_service import AdminService
+from app.services.pricing_service import PricingService
 
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
 
-def check_admin(telegram_id: int):
-    """Check if user is admin"""
-    if telegram_id not in settings.admin_ids_list:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admin access required"
-        )
-
-
 @router.get("/dashboard")
-async def admin_dashboard(admin_id: int, db: AsyncSession = Depends(get_db)):
+async def admin_dashboard(
+    admin: User = Depends(verify_admin),
+    db: AsyncSession = Depends(get_db)
+):
     """
-    Get admin dashboard statistics
+    REAL admin dashboard with live statistics
     """
-    check_admin(admin_id)
+    admin_service = AdminService(db)
     
-    # Get total users
-    users_count = await db.execute(select(func.count(User.id)))
-    total_users = users_count.scalar()
+    try:
+        stats = await admin_service.get_dashboard_stats()
+        
+        return {
+            "status": "success",
+            "data": stats
+        }
     
-    # Get total balance
-    balance_sum = await db.execute(select(func.sum(User.balance_usd)))
-    total_balance = balance_sum.scalar() or 0.0
-    
-    # Get active sessions
-    active_sessions = await db.execute(
-        select(func.count(Session.id)).where(Session.is_active == True)
-    )
-    active_sessions_count = active_sessions.scalar()
-    
-    # Get pending withdraws
-    pending_withdraws = await db.execute(
-        select(func.count(WithdrawRequest.id)).where(WithdrawRequest.status == 'pending')
-    )
-    pending_withdraws_count = pending_withdraws.scalar()
-    
-    return {
-        "total_users": total_users,
-        "total_balance_usd": round(total_balance, 2),
-        "active_sessions": active_sessions_count,
-        "pending_withdraws": pending_withdraws_count,
-    }
-
-
-class SetPriceRequest(BaseModel):
-    price_per_gb: float
-    message: str | None = None
+    except Exception as e:
+        logger.error(f"Admin dashboard error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to load admin dashboard")
 
 
 @router.post("/price/set")
 async def set_daily_price(
-    admin_id: int,
-    request: SetPriceRequest,
+    price_per_gb: float,
+    message: Optional[str] = None,
+    send_notification: bool = True,
+    admin: User = Depends(verify_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Set daily price
+    REAL set daily price (admin only)
     """
-    check_admin(admin_id)
+    pricing_service = PricingService(db)
     
-    today = date.today()
-    
-    # Check if price exists for today
-    result = await db.execute(
-        select(DailyPrice).where(DailyPrice.date == today)
-    )
-    price = result.scalar_one_or_none()
-    
-    if price:
-        price.price_per_gb = request.price_per_gb
-        price.price_per_mb = request.price_per_gb / 1024
-        price.message = request.message
-    else:
-        price = DailyPrice(
-            date=today,
-            price_per_gb=request.price_per_gb,
-            price_per_mb=request.price_per_gb / 1024,
-            message=request.message,
+    try:
+        result = await pricing_service.set_daily_price(
+            admin_id=admin.telegram_id,
+            price_per_gb=price_per_gb,
+            message=message
         )
-        db.add(price)
+        
+        logger.info(
+            f"Admin {admin.telegram_id} set price: ${price_per_gb:.2f}/GB"
+        )
+        
+        return {
+            "status": "success",
+            "data": result
+        }
     
-    await db.commit()
-    
-    # TODO: Send push notification to all users
-    
-    return {
-        "status": "success",
-        "message": "Price updated successfully",
-        "price_per_gb": request.price_per_gb,
-    }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Set price error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to set price")
 
 
-@router.get("/users")
-async def get_all_users(admin_id: int, db: AsyncSession = Depends(get_db)):
+@router.get("/price/history")
+async def get_price_history(
+    days: int = 30,
+    admin: User = Depends(verify_admin),
+    db: AsyncSession = Depends(get_db)
+):
     """
-    Get all users (admin only)
+    REAL price history (admin only)
     """
-    check_admin(admin_id)
+    pricing_service = PricingService(db)
     
-    result = await db.execute(select(User).limit(100))
-    users = result.scalars().all()
-    
-    return {
-        "users": [
-            {
-                "id": u.id,
-                "telegram_id": u.telegram_id,
-                "username": u.username,
-                "first_name": u.first_name,
-                "balance_usd": u.balance_usd,
-                "is_active": u.is_active,
-                "is_banned": u.is_banned,
-                "created_at": u.created_at.isoformat(),
+    try:
+        history = await pricing_service.get_price_history(days=days)
+        
+        return {
+            "status": "success",
+            "data": {
+                "history": history,
+                "days": days
             }
-            for u in users
-        ]
-    }
+        }
+    
+    except Exception as e:
+        logger.error(f"Price history error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get price history")
 
 
-@router.get("/withdraws/pending")
-async def get_pending_withdraws(admin_id: int, db: AsyncSession = Depends(get_db)):
+@router.post("/broadcast")
+async def broadcast_notification(
+    title: str,
+    body: str,
+    admin: User = Depends(verify_admin),
+    db: AsyncSession = Depends(get_db)
+):
     """
-    Get pending withdraw requests
+    REAL broadcast notification to all users (admin only)
     """
-    check_admin(admin_id)
+    from app.services.notification_service import NotificationService
     
-    result = await db.execute(
-        select(WithdrawRequest)
-        .where(WithdrawRequest.status.in_(['pending', 'processing']))
-        .limit(50)
-    )
-    withdraws = result.scalars().all()
+    notif_service = NotificationService(db)
     
-    return {
-        "withdraws": [
-            {
-                "id": w.id,
-                "telegram_id": w.telegram_id,
-                "amount_usd": w.amount_usd,
-                "wallet_address": w.wallet_address,
-                "status": w.status,
-                "created_at": w.created_at.isoformat(),
-            }
-            for w in withdraws
-        ]
-    }
+    try:
+        result = await notif_service.send_to_all_active_users(
+            title=title,
+            body=body,
+            notif_type="system_update"
+        )
+        
+        logger.info(
+            f"Admin {admin.telegram_id} broadcast notification: "
+            f"sent={result['sent']}, failed={result['failed']}"
+        )
+        
+        return {
+            "status": "success",
+            "data": result
+        }
+    
+    except Exception as e:
+        logger.error(f"Broadcast error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to broadcast")
+
+
+@router.post("/reconcile")
+async def run_reconciliation(
+    admin: User = Depends(verify_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    REAL run full reconciliation (admin only)
+    """
+    from app.services.reconciliation_service import ReconciliationService
+    
+    reconciliation_service = ReconciliationService(db)
+    
+    try:
+        result = await reconciliation_service.run_full_reconciliation()
+        
+        logger.info(f"Admin {admin.telegram_id} triggered reconciliation")
+        
+        return {
+            "status": "success",
+            "data": result
+        }
+    
+    except Exception as e:
+        logger.error(f"Reconciliation error: {e}")
+        raise HTTPException(status_code=500, detail="Reconciliation failed")

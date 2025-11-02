@@ -1,372 +1,201 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   View,
-  Text,
   ScrollView,
-  StyleSheet,
-  TouchableOpacity,
   RefreshControl,
-  ActivityIndicator,
-  Image,
+  StyleSheet,
+  Alert,
 } from 'react-native';
-import AsyncStorage from '@react-native-async-storage/async-storage';
-import { API } from '../api/client';
-import Icon from 'react-native-vector-icons/MaterialCommunityIcons';
+import { AnimatedBalance } from '../components/AnimatedBalance';
+import { TrafficProgressBar } from '../components/TrafficProgressBar';
+import { SessionCard } from '../components/SessionCard';
+import { useAuth } from '../hooks/useAuth';
+import { useWebSocket } from '../hooks/useWebSocket';
+import { api } from '../services/api';
+import ForegroundService from '../services/ForegroundService';
 
-export default function DashboardScreen({ navigation }: any) {
-  const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
-  const [dashboardData, setDashboardData] = useState<any>(null);
-  const [sessionActive, setSessionActive] = useState(false);
-  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
+/**
+ * REAL Dashboard screen with animations and live updates
+ */
+export const DashboardScreen: React.FC = () => {
+  const { user } = useAuth();
+  
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [balance, setBalance] = useState(0);
+  const [previousBalance, setPreviousBalance] = useState(0);
+  const [sentMB, setSentMB] = useState(0);
+  const [usedMB, setUsedMB] = useState(0);
+  
+  const [isSessionActive, setIsSessionActive] = useState(false);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [sessionDuration, setSessionDuration] = useState('00:00:00');
+  const [sessionMB, setSessionMB] = useState(0);
+  const [sessionSpeed, setSessionSpeed] = useState(0);
+  const [sessionEarnings, setSessionEarnings] = useState(0);
+
+  // WebSocket for real-time updates
+  const { isConnected, lastMessage } = useWebSocket();
+
+  // Load dashboard data
+  const loadDashboard = useCallback(async () => {
+    try {
+      const response = await api.get(`/dashboard/${user?.telegram_id}`);
+      const data = response.data.data;
+      
+      setPreviousBalance(balance);
+      setBalance(data.balance.usd);
+      setSentMB(data.traffic.sent_mb);
+      setUsedMB(data.traffic.used_mb);
+    } catch (error) {
+      console.error('? Failed to load dashboard:', error);
+    }
+  }, [user, balance]);
+
+  // Pull to refresh
+  const onRefresh = useCallback(async () => {
+    setIsRefreshing(true);
+    await loadDashboard();
+    setIsRefreshing(false);
+  }, [loadDashboard]);
+
+  // Handle WebSocket messages
+  useEffect(() => {
+    if (lastMessage) {
+      const message = JSON.parse(lastMessage.data);
+      
+      if (message.type === 'session_update') {
+        setSessionMB(message.mb_sent);
+        setSessionSpeed(message.speed_mbps);
+        setSessionEarnings(message.estimated_earnings);
+        
+        // Update foreground service notification
+        if (isSessionActive) {
+          ForegroundService.updateNotification({
+            sessionId: message.session_id,
+            mbSent: message.mb_sent,
+            speedMbps: message.speed_mbps,
+            durationSec: message.duration_sec,
+            estimatedEarnings: message.estimated_earnings,
+          });
+        }
+      } else if (message.type === 'balance_update') {
+        setPreviousBalance(balance);
+        setBalance(message.new_balance);
+      }
+    }
+  }, [lastMessage, isSessionActive, balance]);
+
+  // Start session
+  const handleStartSession = async () => {
+    try {
+      const response = await api.post('/traffic/start', {
+        telegram_id: user?.telegram_id,
+      });
+      
+      if (response.data.status === 'ok') {
+        setIsSessionActive(true);
+        setSessionId(response.data.session_id);
+        
+        // Start foreground service
+        await ForegroundService.start(response.data.session_id);
+        
+        Alert.alert('? Sessiya boshlandi', 'Trafik ulashish boshlandi!');
+      } else {
+        Alert.alert('? Xato', response.data.message || 'Sessiya boshlanmadi');
+      }
+    } catch (error: any) {
+      const errorMsg = error.response?.data?.detail || 'Xatolik yuz berdi';
+      Alert.alert('? Xato', errorMsg);
+    }
+  };
+
+  // Stop session
+  const handleStopSession = async () => {
+    if (!sessionId) return;
+    
+    Alert.alert(
+      '?? Tasdiqlash',
+      'Sessiyani to\'xtatishni xohlaysizmi?',
+      [
+        { text: 'Yo\'q', style: 'cancel' },
+        {
+          text: 'Ha',
+          onPress: async () => {
+            try {
+              await api.post('/traffic/stop', {
+                telegram_id: user?.telegram_id,
+                session_id: sessionId,
+              });
+              
+              // Stop foreground service
+              await ForegroundService.stop();
+              
+              setIsSessionActive(false);
+              setSessionId(null);
+              setSessionMB(0);
+              setSessionSpeed(0);
+              setSessionEarnings(0);
+              
+              // Reload dashboard
+              await loadDashboard();
+              
+              Alert.alert('? Sessiya to\'xtatildi', 'Daromad balansingizga qo\'shildi!');
+            } catch (error) {
+              console.error('? Failed to stop session:', error);
+              Alert.alert('? Xato', 'Sessiyani to\'xtatishda xatolik');
+            }
+          },
+        },
+      ]
+    );
+  };
 
   useEffect(() => {
     loadDashboard();
   }, []);
 
-  const loadDashboard = async () => {
-    try {
-      const userData = await AsyncStorage.getItem('user_data');
-      if (userData) {
-        const user = JSON.parse(userData);
-        const response = await API.getDashboard(user.telegram_id);
-        setDashboardData(response.data);
-      }
-    } catch (error) {
-      console.error('Load dashboard error:', error);
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
-    }
-  };
-
-  const handleStartStop = async () => {
-    try {
-      const userData = await AsyncStorage.getItem('user_data');
-      if (!userData) return;
-
-      const user = JSON.parse(userData);
-
-      if (!sessionActive) {
-        // Start session
-        const response = await API.startSession({
-          telegram_id: user.telegram_id,
-          device_id: 'android_device',
-          network_type: 'wifi',
-        });
-        
-        if (response.data.status === 'ok') {
-          setSessionActive(true);
-          setCurrentSessionId(response.data.session_id);
-        }
-      } else {
-        // Stop session
-        if (currentSessionId) {
-          await API.stopSession(currentSessionId);
-          setSessionActive(false);
-          setCurrentSessionId(null);
-        }
-      }
-    } catch (error) {
-      console.error('Start/Stop error:', error);
-    }
-  };
-
-  const onRefresh = () => {
-    setRefreshing(true);
-    loadDashboard();
-  };
-
-  if (loading) {
-    return (
-      <View style={styles.loadingContainer}>
-        <ActivityIndicator size="large" color="#007bff" />
-      </View>
-    );
-  }
-
-  if (!dashboardData) {
-    return (
-      <View style={styles.loadingContainer}>
-        <Text>Ma'lumot yuklanmadi</Text>
-      </View>
-    );
-  }
-
   return (
     <ScrollView
       style={styles.container}
       refreshControl={
-        <RefreshControl refreshing={refreshing} onRefresh={onRefresh} />
+        <RefreshControl refreshing={isRefreshing} onRefresh={onRefresh} />
       }
     >
-      {/* Profile Block */}
-      <View style={styles.profileBlock}>
-        <View style={styles.profileInfo}>
-          {dashboardData.user.photo_url ? (
-            <Image
-              source={{ uri: dashboardData.user.photo_url }}
-              style={styles.avatar}
-            />
-          ) : (
-            <View style={styles.avatarPlaceholder}>
-              <Icon name="account" size={40} color="#fff" />
-            </View>
-          )}
-          <View style={styles.profileText}>
-            <Text style={styles.profileName}>
-              {dashboardData.user.first_name}
-            </Text>
-            <Text style={styles.profileUsername}>
-              @{dashboardData.user.username}
-            </Text>
-          </View>
-        </View>
-      </View>
+      <View style={styles.content}>
+        {/* Animated Balance */}
+        <AnimatedBalance
+          balance={balance}
+          previousBalance={previousBalance}
+        />
 
-      {/* Balance Block */}
-      <View style={styles.card}>
-        <Text style={styles.cardTitle}>?? Balans</Text>
-        <Text style={styles.balanceAmount}>
-          ${dashboardData.balance.usd.toFixed(2)}
-        </Text>
-      </View>
+        {/* Session Control */}
+        <SessionCard
+          isActive={isSessionActive}
+          sessionId={sessionId || undefined}
+          duration={sessionDuration}
+          mbSent={sessionMB}
+          speedMbps={sessionSpeed}
+          estimatedEarnings={sessionEarnings}
+          onStart={handleStartSession}
+          onStop={handleStopSession}
+        />
 
-      {/* Price Block */}
-      <View style={styles.card}>
-        <Text style={styles.cardTitle}>?? Bugungi narx</Text>
-        <Text style={styles.priceAmount}>
-          ${dashboardData.pricing.price_per_gb.toFixed(2)} / GB
-        </Text>
-        {dashboardData.pricing.message && (
-          <Text style={styles.priceMessage}>
-            {dashboardData.pricing.message}
-          </Text>
-        )}
-      </View>
-
-      {/* Traffic Block */}
-      <View style={styles.card}>
-        <Text style={styles.cardTitle}>?? Trafik</Text>
-        <View style={styles.trafficRow}>
-          <Text style={styles.trafficLabel}>Yuborilgan:</Text>
-          <Text style={styles.trafficValue}>
-            {dashboardData.traffic.sent_mb.toFixed(2)} MB
-          </Text>
-        </View>
-        <View style={styles.trafficRow}>
-          <Text style={styles.trafficLabel}>Ishlatilgan:</Text>
-          <Text style={styles.trafficValue}>
-            {dashboardData.traffic.used_mb.toFixed(2)} MB
-          </Text>
-        </View>
-        <View style={styles.trafficRow}>
-          <Text style={styles.trafficLabel}>Qolgan:</Text>
-          <Text style={styles.trafficValue}>
-            {dashboardData.traffic.remaining_mb.toFixed(2)} MB
-          </Text>
-        </View>
-      </View>
-
-      {/* Action Buttons */}
-      <View style={styles.actionsContainer}>
-        <TouchableOpacity
-          style={[
-            styles.actionButton,
-            sessionActive ? styles.stopButton : styles.startButton,
-          ]}
-          onPress={handleStartStop}
-        >
-          <Text style={styles.actionButtonText}>
-            {sessionActive ? '?? STOP' : '?? START'}
-          </Text>
-        </TouchableOpacity>
-
-        <TouchableOpacity
-          style={[styles.actionButton, styles.withdrawButton]}
-          onPress={() => navigation.navigate('Withdraw')}
-          disabled={dashboardData.balance.usd < 1.39}
-        >
-          <Text style={styles.actionButtonText}>?? YECHISH</Text>
-        </TouchableOpacity>
-      </View>
-
-      {/* Quick Actions */}
-      <View style={styles.quickActions}>
-        <TouchableOpacity
-          style={styles.quickActionButton}
-          onPress={() => navigation.navigate('SessionHistory')}
-        >
-          <Icon name="history" size={24} color="#007bff" />
-          <Text style={styles.quickActionText}>Sessiyalar</Text>
-        </TouchableOpacity>
-
-        <TouchableOpacity
-          style={styles.quickActionButton}
-          onPress={() => navigation.navigate('Support')}
-        >
-          <Icon name="help-circle" size={24} color="#007bff" />
-          <Text style={styles.quickActionText}>Yordam</Text>
-        </TouchableOpacity>
-
-        <TouchableOpacity
-          style={styles.quickActionButton}
-          onPress={() => navigation.navigate('News')}
-        >
-          <Icon name="newspaper" size={24} color="#007bff" />
-          <Text style={styles.quickActionText}>Yangiliklar</Text>
-        </TouchableOpacity>
-
-        <TouchableOpacity
-          style={styles.quickActionButton}
-          onPress={() => navigation.navigate('Settings')}
-        >
-          <Icon name="cog" size={24} color="#007bff" />
-          <Text style={styles.quickActionText}>Sozlamalar</Text>
-        </TouchableOpacity>
+        {/* Traffic Progress */}
+        <TrafficProgressBar
+          sentMB={sentMB}
+          usedMB={usedMB}
+        />
       </View>
     </ScrollView>
   );
-}
+};
 
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#f5f5f5',
+    backgroundColor: '#121212',
   },
-  loadingContainer: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  profileBlock: {
-    backgroundColor: '#007bff',
-    padding: 20,
-    paddingTop: 40,
-  },
-  profileInfo: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-  avatar: {
-    width: 60,
-    height: 60,
-    borderRadius: 30,
-  },
-  avatarPlaceholder: {
-    width: 60,
-    height: 60,
-    borderRadius: 30,
-    backgroundColor: '#0056b3',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  profileText: {
-    marginLeft: 15,
-  },
-  profileName: {
-    color: '#fff',
-    fontSize: 20,
-    fontWeight: 'bold',
-  },
-  profileUsername: {
-    color: '#e0e0e0',
-    fontSize: 14,
-  },
-  card: {
-    backgroundColor: '#fff',
-    margin: 15,
-    padding: 20,
-    borderRadius: 10,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 4,
-    elevation: 3,
-  },
-  cardTitle: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#333',
-    marginBottom: 10,
-  },
-  balanceAmount: {
-    fontSize: 32,
-    fontWeight: 'bold',
-    color: '#28a745',
-  },
-  priceAmount: {
-    fontSize: 24,
-    fontWeight: 'bold',
-    color: '#007bff',
-  },
-  priceMessage: {
-    fontSize: 12,
-    color: '#666',
-    marginTop: 5,
-  },
-  trafficRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    marginVertical: 5,
-  },
-  trafficLabel: {
-    fontSize: 14,
-    color: '#666',
-  },
-  trafficValue: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: '#333',
-  },
-  actionsContainer: {
-    flexDirection: 'row',
-    paddingHorizontal: 15,
-    marginBottom: 15,
-  },
-  actionButton: {
-    flex: 1,
-    paddingVertical: 15,
-    borderRadius: 10,
-    alignItems: 'center',
-    marginHorizontal: 5,
-  },
-  startButton: {
-    backgroundColor: '#28a745',
-  },
-  stopButton: {
-    backgroundColor: '#dc3545',
-  },
-  withdrawButton: {
-    backgroundColor: '#ffc107',
-  },
-  actionButtonText: {
-    color: '#fff',
-    fontSize: 16,
-    fontWeight: 'bold',
-  },
-  quickActions: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    paddingHorizontal: 15,
-    marginBottom: 20,
-  },
-  quickActionButton: {
-    width: '45%',
-    backgroundColor: '#fff',
-    padding: 15,
-    borderRadius: 10,
-    alignItems: 'center',
-    margin: '2.5%',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.1,
-    shadowRadius: 2,
-    elevation: 2,
-  },
-  quickActionText: {
-    marginTop: 8,
-    fontSize: 12,
-    color: '#333',
+  content: {
+    padding: 16,
   },
 });
