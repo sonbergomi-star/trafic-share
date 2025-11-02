@@ -1,0 +1,59 @@
+Generic single-database configuration.
+
+# Alembic Database Migrations
+
+This directory contains database migration scripts for the Traffic Platform project.
+
+## Usage
+
+### Create a new migration
+
+```bash
+# Auto-generate migration from models
+alembic revision --autogenerate -m "description of changes"
+
+# Create empty migration
+alembic revision -m "description of changes"
+```
+
+### Apply migrations
+
+```bash
+# Upgrade to latest
+alembic upgrade head
+
+# Upgrade one version
+alembic upgrade +1
+
+# Downgrade one version
+alembic downgrade -1
+
+# Downgrade to base
+alembic downgrade base
+```
+
+### View migration history
+
+```bash
+# Show current version
+alembic current
+
+# Show history
+alembic history
+
+# Show pending migrations
+alembic history -r current:head
+```
+
+## Migration Files
+
+- `env.py` - Alembic environment configuration
+- `script.py.mako` - Template for new migrations
+- `versions/` - Migration scripts directory
+
+## Notes
+
+- Always review auto-generated migrations before applying
+- Test migrations in development before production
+- Keep migrations small and focused
+- Add comments for complex operations
