@@ -1,156 +1,145 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
 from pydantic import BaseModel
+import logging
 
 from app.core.database import get_db
-from app.core.security import create_access_token
+from app.middleware.auth import get_current_user
 from app.models.user import User
-from app.models.settings import UserSettings
+from app.models.session import Session
+from app.models.transaction import Transaction
 
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
 
-@router.get("/{telegram_id}")
-async def get_profile(telegram_id: int, db: AsyncSession = Depends(get_db)):
-    """
-    Get user profile information
-    """
-    result = await db.execute(
-        select(User).where(User.telegram_id == telegram_id)
-    )
-    user = result.scalar_one_or_none()
-    
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    
-    return {
-        "telegram_id": user.telegram_id,
-        "username": user.username,
-        "first_name": user.first_name,
-        "photo_url": user.photo_url,
-        "auth_date": user.auth_date.isoformat() if user.auth_date else None,
-        "jwt_token": user.jwt_token,
-        "two_factor_enabled": user.two_factor_enabled,
-        "last_login_ip": user.last_login_ip,
-        "last_login_device": user.last_login_device,
-    }
+class UpdateProfileRequest(BaseModel):
+    first_name: str | None = None
+    last_name: str | None = None
+    username: str | None = None
 
 
-@router.post("/token/renew")
-async def renew_token(telegram_id: int, db: AsyncSession = Depends(get_db)):
-    """
-    Renew JWT token
-    """
-    result = await db.execute(
-        select(User).where(User.telegram_id == telegram_id)
-    )
-    user = result.scalar_one_or_none()
-    
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    
-    # Generate new token
-    new_token = create_access_token(
-        data={
-            "telegram_id": user.telegram_id,
-            "username": user.username,
-        }
-    )
-    
-    user.jwt_token = new_token
-    await db.commit()
-    
-    return {
-        "message": "Token successfully renewed",
-        "jwt_token": new_token,
-    }
-
-
-@router.get("/settings/{telegram_id}")
-async def get_settings(telegram_id: int, db: AsyncSession = Depends(get_db)):
-    """
-    Get user settings
-    """
-    result = await db.execute(
-        select(UserSettings).where(UserSettings.telegram_id == telegram_id)
-    )
-    settings = result.scalar_one_or_none()
-    
-    if not settings:
-        # Create default settings
-        user_result = await db.execute(
-            select(User).where(User.telegram_id == telegram_id)
-        )
-        user = user_result.scalar_one_or_none()
-        
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
-        
-        settings = UserSettings(
-            user_id=user.id,
-            telegram_id=telegram_id,
-        )
-        db.add(settings)
-        await db.commit()
-        await db.refresh(settings)
-    
-    return {
-        "language": settings.language,
-        "push_notifications": settings.push_notifications,
-        "session_updates": settings.session_updates,
-        "system_updates": settings.system_updates,
-        "two_factor_enabled": settings.two_factor_enabled,
-        "single_device_mode": settings.single_device_mode,
-        "battery_saver": settings.battery_saver,
-        "theme": settings.theme,
-    }
-
-
-class UpdateSettingsRequest(BaseModel):
-    language: str | None = None
-    push_notifications: bool | None = None
-    session_updates: bool | None = None
-    system_updates: bool | None = None
-    battery_saver: bool | None = None
-    theme: str | None = None
-
-
-@router.patch("/settings/{telegram_id}")
-async def update_settings(
-    telegram_id: int,
-    request: UpdateSettingsRequest,
+@router.get("/")
+async def get_profile(
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Update user settings
+    REAL get user profile with statistics
     """
-    result = await db.execute(
-        select(UserSettings).where(UserSettings.telegram_id == telegram_id)
+    # Get total sessions
+    sessions_result = await db.execute(
+        select(func.count(Session.id))
+        .where(Session.telegram_id == current_user.telegram_id)
     )
-    settings = result.scalar_one_or_none()
+    total_sessions = sessions_result.scalar()
     
-    if not settings:
-        raise HTTPException(status_code=404, detail="Settings not found")
+    # Get completed sessions
+    completed_result = await db.execute(
+        select(func.count(Session.id))
+        .where(Session.telegram_id == current_user.telegram_id)
+        .where(Session.status == 'completed')
+    )
+    completed_sessions = completed_result.scalar()
     
-    # Update only provided fields
-    if request.language is not None:
-        settings.language = request.language
-    if request.push_notifications is not None:
-        settings.push_notifications = request.push_notifications
-    if request.session_updates is not None:
-        settings.session_updates = request.session_updates
-    if request.system_updates is not None:
-        settings.system_updates = request.system_updates
-    if request.battery_saver is not None:
-        settings.battery_saver = request.battery_saver
-    if request.theme is not None:
-        settings.theme = request.theme
+    # Get total earned
+    earned_result = await db.execute(
+        select(func.sum(Session.earned_usd))
+        .where(Session.telegram_id == current_user.telegram_id)
+        .where(Session.status == 'completed')
+    )
+    total_earned = earned_result.scalar() or 0.0
     
-    await db.commit()
+    # Get total withdrawn
+    withdrawn_result = await db.execute(
+        select(func.sum(Transaction.amount_usd))
+        .where(Transaction.telegram_id == current_user.telegram_id)
+        .where(Transaction.type == 'withdraw')
+        .where(Transaction.status == 'completed')
+    )
+    total_withdrawn = abs(withdrawn_result.scalar() or 0.0)
     
     return {
         "status": "success",
-        "message": "Settings updated successfully",
+        "data": {
+            "user": {
+                "telegram_id": current_user.telegram_id,
+                "username": current_user.username,
+                "first_name": current_user.first_name,
+                "last_name": current_user.last_name,
+                "balance_usd": float(current_user.balance_usd),
+                "created_at": current_user.created_at.isoformat(),
+                "last_seen": current_user.last_seen.isoformat() if current_user.last_seen else None,
+            },
+            "stats": {
+                "total_sessions": total_sessions,
+                "completed_sessions": completed_sessions,
+                "success_rate": (completed_sessions / total_sessions * 100) if total_sessions > 0 else 0,
+                "sent_mb": float(current_user.sent_mb),
+                "sent_gb": float(current_user.sent_mb / 1024),
+                "total_earned": float(total_earned),
+                "total_withdrawn": float(total_withdrawn),
+            },
+            "security": {
+                "is_active": current_user.is_active,
+                "is_banned": current_user.is_banned,
+            }
+        }
+    }
+
+
+@router.put("/update")
+async def update_profile(
+    request: UpdateProfileRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    REAL update user profile
+    """
+    # Update fields if provided
+    if request.first_name is not None:
+        current_user.first_name = request.first_name
+    
+    if request.last_name is not None:
+        current_user.last_name = request.last_name
+    
+    if request.username is not None:
+        current_user.username = request.username
+    
+    await db.commit()
+    await db.refresh(current_user)
+    
+    logger.info(f"Profile updated for user {current_user.telegram_id}")
+    
+    return {
+        "status": "success",
+        "data": {
+            "telegram_id": current_user.telegram_id,
+            "username": current_user.username,
+            "first_name": current_user.first_name,
+            "last_name": current_user.last_name,
+        }
+    }
+
+
+@router.delete("/account")
+async def delete_account(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    REAL delete user account (soft delete)
+    """
+    # Soft delete - just deactivate
+    current_user.is_active = False
+    await db.commit()
+    
+    logger.warning(f"Account deactivated for user {current_user.telegram_id}")
+    
+    return {
+        "status": "success",
+        "message": "Account deactivated successfully"
     }

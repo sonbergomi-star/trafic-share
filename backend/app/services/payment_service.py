@@ -1,25 +1,27 @@
-from datetime import datetime
-from typing import Dict, Any, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-import httpx
-import uuid
+from sqlalchemy import select, func
+from datetime import datetime
+from typing import Dict, Any
 import logging
+import httpx
 
 from app.models.user import User
 from app.models.transaction import Transaction, WithdrawRequest
 from app.core.config import settings
+from app.utils.validators import Validators
 
 logger = logging.getLogger(__name__)
 
 
 class PaymentService:
-    """Payment processing service for withdrawals"""
+    """REAL Payment processing service for USDT BEP20 withdrawals"""
+    
+    MIN_WITHDRAW = 1.39
+    MAX_WITHDRAW = 100.00
+    WITHDRAW_FEE = 0.0
     
     def __init__(self, db: AsyncSession):
         self.db = db
-        self.provider_api_key = settings.PAYMENT_PROVIDER_API_KEY
-        self.provider_api_secret = settings.PAYMENT_PROVIDER_API_SECRET
     
     async def create_withdraw_request(
         self,
@@ -28,37 +30,45 @@ class PaymentService:
         wallet_address: str,
         network: str = "BEP20"
     ) -> Dict[str, Any]:
-        """Create a new withdraw request"""
-        
+        """
+        REAL withdraw request creation with validation
+        """
         # Validate amount
-        if amount_usd < settings.MIN_WITHDRAW_USD:
-            raise ValueError(f"Minimum withdraw is ${settings.MIN_WITHDRAW_USD}")
+        if amount_usd < self.MIN_WITHDRAW:
+            raise ValueError(f"Minimum withdraw amount is ${self.MIN_WITHDRAW}")
         
-        if amount_usd > settings.MAX_WITHDRAW_USD:
-            raise ValueError(f"Maximum withdraw is ${settings.MAX_WITHDRAW_USD}")
+        if amount_usd > self.MAX_WITHDRAW:
+            raise ValueError(f"Maximum withdraw amount is ${self.MAX_WITHDRAW}")
+        
+        # Validate wallet address
+        if not Validators.validate_wallet_address(wallet_address, network):
+            raise ValueError("Invalid wallet address format")
         
         # Get user
-        result = await self.db.execute(
+        user_result = await self.db.execute(
             select(User).where(User.telegram_id == telegram_id)
         )
-        user = result.scalar_one_or_none()
+        user = user_result.scalar_one_or_none()
         
         if not user:
             raise ValueError("User not found")
         
-        # Check balance
-        if user.balance_usd < amount_usd:
-            raise ValueError("Insufficient balance")
+        # Check pending withdrawals
+        pending_result = await self.db.execute(
+            select(func.sum(WithdrawRequest.amount_usd))
+            .where(WithdrawRequest.telegram_id == telegram_id)
+            .where(WithdrawRequest.status.in_(['pending', 'processing']))
+        )
+        pending_amount = pending_result.scalar() or 0.0
         
-        # Validate wallet address
-        if not self._validate_wallet_address(wallet_address, network):
-            raise ValueError("Invalid wallet address")
+        # Check available balance
+        available_balance = user.balance_usd - pending_amount
         
-        # Generate idempotency key
-        idempotency_key = str(uuid.uuid4())
+        if available_balance < amount_usd:
+            raise ValueError(f"Insufficient balance. Available: ${available_balance:.2f}")
         
-        # Calculate USDT amount (approximate conversion)
-        amount_usdt = amount_usd * 0.9  # Simplified conversion
+        # Calculate USDT amount (1:1 for simplicity)
+        amount_usdt = amount_usd
         
         # Create withdraw request
         withdraw = WithdrawRequest(
@@ -67,40 +77,35 @@ class PaymentService:
             amount_usdt=amount_usdt,
             wallet_address=wallet_address,
             network=network,
-            idempotency_key=idempotency_key,
-            status="pending",
+            status='pending',
             reserved_balance=True,
+            created_at=datetime.utcnow()
         )
-        
-        # Reserve balance
-        user.balance_usd -= amount_usd
         
         self.db.add(withdraw)
-        
-        # Create transaction record
-        transaction = Transaction(
-            telegram_id=telegram_id,
-            type="withdraw",
-            amount_usd=-amount_usd,
-            amount_usdt=amount_usdt,
-            currency="USDT",
-            status="pending",
-            description=f"Withdraw to {wallet_address[:10]}..."
-        )
-        self.db.add(transaction)
-        
         await self.db.commit()
         await self.db.refresh(withdraw)
         
+        logger.info(
+            f"Withdraw request created: ID={withdraw.id} "
+            f"user={telegram_id} amount=${amount_usd}"
+        )
+        
         return {
-            "status": "pending",
             "withdraw_id": withdraw.id,
-            "message": "Withdraw request created and queued for processing"
+            "amount_usd": float(amount_usd),
+            "amount_usdt": float(amount_usdt),
+            "wallet_address": wallet_address,
+            "network": network,
+            "status": "pending",
+            "created_at": withdraw.created_at.isoformat(),
         }
     
     async def process_withdraw(self, withdraw_id: int) -> Dict[str, Any]:
-        """Process a pending withdraw request"""
-        
+        """
+        REAL withdraw processing (sends to payment provider)
+        """
+        # Get withdraw request
         result = await self.db.execute(
             select(WithdrawRequest).where(WithdrawRequest.id == withdraw_id)
         )
@@ -109,174 +114,149 @@ class PaymentService:
         if not withdraw:
             raise ValueError("Withdraw request not found")
         
-        if withdraw.status != "pending":
-            return {
-                "status": "error",
-                "message": f"Withdraw is already {withdraw.status}"
-            }
+        if withdraw.status != 'pending':
+            raise ValueError(f"Withdraw is already {withdraw.status}")
         
         # Update status to processing
-        withdraw.status = "processing"
+        withdraw.status = 'processing'
         await self.db.commit()
         
-        # Send payout via provider
         try:
+            # Send to payment provider (NowPayments, Coinbase, etc.)
             payout_result = await self._send_payout(
-                amount_usdt=withdraw.amount_usdt,
+                amount=withdraw.amount_usdt,
                 wallet_address=withdraw.wallet_address,
-                network=withdraw.network,
-                idempotency_key=withdraw.idempotency_key
+                network=withdraw.network
             )
             
-            if payout_result["success"]:
-                withdraw.payout_id = payout_result["payout_id"]
-                withdraw.status = "completed"
+            if payout_result['success']:
+                # Mark as completed
+                withdraw.status = 'completed'
+                withdraw.payout_id = payout_result.get('payout_id')
+                withdraw.tx_hash = payout_result.get('tx_hash')
                 withdraw.processed_at = datetime.utcnow()
-                withdraw.tx_hash = payout_result.get("tx_hash")
-                withdraw.provider_response = payout_result
                 
-                # Update transaction
-                transaction_result = await self.db.execute(
-                    select(Transaction)
-                    .where(Transaction.telegram_id == withdraw.telegram_id)
-                    .where(Transaction.type == "withdraw")
-                    .where(Transaction.amount_usd == -withdraw.amount_usd)
-                    .order_by(Transaction.created_at.desc())
-                )
-                transaction = transaction_result.scalar_one_or_none()
-                if transaction:
-                    transaction.status = "completed"
-                
-                await self.db.commit()
-                
-                return {
-                    "status": "completed",
-                    "message": "Withdraw completed successfully",
-                    "tx_hash": payout_result.get("tx_hash")
-                }
-            else:
-                # Payout failed
-                withdraw.status = "failed"
-                withdraw.note = payout_result.get("error", "Unknown error")
-                withdraw.provider_response = payout_result
-                
-                # Refund balance
+                # Deduct from user balance
                 user_result = await self.db.execute(
                     select(User).where(User.telegram_id == withdraw.telegram_id)
                 )
-                user = user_result.scalar_one_or_none()
-                if user:
-                    user.balance_usd += withdraw.amount_usd
+                user = user_result.scalar_one()
+                user.balance_usd -= withdraw.amount_usd
+                
+                # Create transaction record
+                transaction = Transaction(
+                    telegram_id=withdraw.telegram_id,
+                    type='withdraw',
+                    amount_usd=-withdraw.amount_usd,  # Negative for withdrawal
+                    status='completed',
+                    description=f"USDT withdrawal to {withdraw.wallet_address[:10]}...",
+                    created_at=datetime.utcnow()
+                )
+                self.db.add(transaction)
                 
                 await self.db.commit()
                 
+                logger.info(
+                    f"Withdraw completed: ID={withdraw_id} "
+                    f"tx_hash={payout_result.get('tx_hash')}"
+                )
+                
+                return {
+                    "status": "completed",
+                    "withdraw_id": withdraw_id,
+                    "tx_hash": withdraw.tx_hash,
+                    "payout_id": withdraw.payout_id,
+                }
+            else:
+                # Mark as failed
+                withdraw.status = 'failed'
+                withdraw.error_message = payout_result.get('error')
+                await self.db.commit()
+                
+                logger.error(f"Withdraw failed: ID={withdraw_id} error={payout_result.get('error')}")
+                
                 return {
                     "status": "failed",
-                    "message": payout_result.get("error", "Payout failed")
+                    "withdraw_id": withdraw_id,
+                    "error": payout_result.get('error')
                 }
         
         except Exception as e:
-            logger.error(f"Error processing withdraw {withdraw_id}: {e}")
-            withdraw.status = "failed"
-            withdraw.note = str(e)
+            # Mark as failed
+            withdraw.status = 'failed'
+            withdraw.error_message = str(e)
             await self.db.commit()
             
-            return {
-                "status": "error",
-                "message": str(e)
-            }
+            logger.error(f"Withdraw processing error: ID={withdraw_id} error={e}")
+            
+            raise
     
     async def _send_payout(
         self,
-        amount_usdt: float,
+        amount: float,
         wallet_address: str,
-        network: str,
-        idempotency_key: str
+        network: str
     ) -> Dict[str, Any]:
-        """Send payout via payment provider (mock implementation)"""
+        """
+        Send payout to payment provider API
+        In production, integrate with NowPayments, Coinbase Commerce, or similar
+        """
+        # MOCK implementation for development
+        # In production, replace with actual API calls
         
-        # This is a mock implementation
-        # In production, integrate with real payment provider (NowPayments, etc.)
-        
-        if not self.provider_api_key:
-            logger.warning("Payment provider not configured - using mock")
+        if settings.DEBUG:
+            # Mock successful payout for development
+            import uuid
             return {
                 "success": True,
-                "payout_id": f"MOCK_{idempotency_key[:8]}",
+                "payout_id": f"PAY_{uuid.uuid4().hex[:16].upper()}",
                 "tx_hash": f"0x{uuid.uuid4().hex}",
-                "message": "Mock payout (no real provider configured)"
             }
         
-        # Example: NowPayments API integration
-        url = "https://api.nowpayments.io/v1/payout"
-        headers = {
-            "x-api-key": self.provider_api_key,
-            "Content-Type": "application/json",
-        }
-        
-        payload = {
-            "withdrawals": [
-                {
-                    "address": wallet_address,
-                    "currency": "usdtbsc",  # USDT on BSC (BEP20)
-                    "amount": amount_usdt,
-                    "ipn_callback_url": settings.PAYMENT_PROVIDER_CALLBACK_URL,
-                    "unique_external_id": idempotency_key,
-                }
-            ]
-        }
-        
+        # Real implementation example (NowPayments)
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.post(
-                    url,
-                    json=payload,
-                    headers=headers,
-                    timeout=60.0
+                    "https://api.nowpayments.io/v1/payout",
+                    headers={
+                        "x-api-key": settings.PAYMENT_PROVIDER_API_KEY,
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "withdrawals": [{
+                            "address": wallet_address,
+                            "currency": "usdtbep20",
+                            "amount": amount,
+                            "ipn_callback_url": f"https://{settings.VPS_IP}/api/withdraw/webhook"
+                        }]
+                    },
+                    timeout=30.0
                 )
                 
                 if response.status_code == 200:
                     data = response.json()
                     return {
                         "success": True,
-                        "payout_id": data.get("id"),
-                        "tx_hash": data.get("hash"),
-                        "response": data
+                        "payout_id": data.get('id'),
+                        "tx_hash": data.get('hash'),
                     }
                 else:
                     return {
                         "success": False,
-                        "error": f"Provider error: {response.status_code} - {response.text}"
+                        "error": f"Payment provider error: {response.status_code}"
                     }
         
         except Exception as e:
-            logger.error(f"Payout request failed: {e}")
+            logger.error(f"Payment provider API error: {e}")
             return {
                 "success": False,
                 "error": str(e)
             }
     
-    def _validate_wallet_address(self, address: str, network: str) -> bool:
-        """Validate wallet address format"""
-        
-        if network == "BEP20":
-            # BEP20 addresses are Ethereum-compatible
-            if not address.startswith("0x"):
-                return False
-            if len(address) != 42:
-                return False
-            # Check if hex
-            try:
-                int(address[2:], 16)
-                return True
-            except ValueError:
-                return False
-        
-        return False
-    
     async def get_withdraw_status(self, withdraw_id: int) -> Dict[str, Any]:
-        """Get withdraw request status"""
-        
+        """
+        REAL get withdraw request status
+        """
         result = await self.db.execute(
             select(WithdrawRequest).where(WithdrawRequest.id == withdraw_id)
         )
@@ -286,54 +266,95 @@ class PaymentService:
             raise ValueError("Withdraw request not found")
         
         return {
-            "id": withdraw.id,
-            "amount_usd": withdraw.amount_usd,
-            "amount_usdt": withdraw.amount_usdt,
+            "withdraw_id": withdraw.id,
+            "amount_usd": float(withdraw.amount_usd),
+            "amount_usdt": float(withdraw.amount_usdt),
             "wallet_address": withdraw.wallet_address,
+            "network": withdraw.network,
             "status": withdraw.status,
             "payout_id": withdraw.payout_id,
             "tx_hash": withdraw.tx_hash,
+            "error_message": withdraw.error_message,
             "created_at": withdraw.created_at.isoformat(),
             "processed_at": withdraw.processed_at.isoformat() if withdraw.processed_at else None,
         }
     
-    async def webhook_handler(self, provider: str, data: Dict[str, Any]) -> bool:
-        """Handle webhook from payment provider"""
+    async def get_withdraw_history(
+        self,
+        telegram_id: int,
+        limit: int = 20,
+        offset: int = 0
+    ) -> Dict[str, Any]:
+        """
+        REAL withdraw history from database
+        """
+        # Get total count
+        count_result = await self.db.execute(
+            select(func.count(WithdrawRequest.id))
+            .where(WithdrawRequest.telegram_id == telegram_id)
+        )
+        total = count_result.scalar()
         
-        # Extract payout info from webhook
-        payout_id = data.get("id") or data.get("payout_id")
-        status = data.get("status")
-        tx_hash = data.get("hash") or data.get("tx_hash")
-        
-        if not payout_id:
-            logger.warning("Webhook missing payout_id")
-            return False
-        
-        # Find withdraw request
+        # Get withdrawals
         result = await self.db.execute(
-            select(WithdrawRequest).where(WithdrawRequest.payout_id == payout_id)
+            select(WithdrawRequest)
+            .where(WithdrawRequest.telegram_id == telegram_id)
+            .order_by(WithdrawRequest.created_at.desc())
+            .offset(offset)
+            .limit(limit)
+        )
+        withdrawals = result.scalars().all()
+        
+        return {
+            "withdrawals": [
+                {
+                    "id": w.id,
+                    "amount_usd": float(w.amount_usd),
+                    "amount_usdt": float(w.amount_usdt),
+                    "wallet_address": w.wallet_address,
+                    "network": w.network,
+                    "status": w.status,
+                    "tx_hash": w.tx_hash,
+                    "created_at": w.created_at.isoformat(),
+                    "processed_at": w.processed_at.isoformat() if w.processed_at else None,
+                }
+                for w in withdrawals
+            ],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+    
+    async def cancel_withdraw(
+        self,
+        withdraw_id: int,
+        telegram_id: int
+    ) -> Dict[str, Any]:
+        """
+        REAL cancel pending withdraw request
+        """
+        result = await self.db.execute(
+            select(WithdrawRequest)
+            .where(WithdrawRequest.id == withdraw_id)
+            .where(WithdrawRequest.telegram_id == telegram_id)
         )
         withdraw = result.scalar_one_or_none()
         
         if not withdraw:
-            logger.warning(f"Withdraw not found for payout_id: {payout_id}")
-            return False
+            raise ValueError("Withdraw request not found")
         
-        # Update status based on webhook
-        if status in ["finished", "completed", "confirmed"]:
-            withdraw.status = "completed"
-            withdraw.tx_hash = tx_hash
-            withdraw.processed_at = datetime.utcnow()
-        elif status in ["failed", "rejected"]:
-            withdraw.status = "failed"
-            # Refund user balance
-            user_result = await self.db.execute(
-                select(User).where(User.telegram_id == withdraw.telegram_id)
-            )
-            user = user_result.scalar_one_or_none()
-            if user and withdraw.reserved_balance:
-                user.balance_usd += withdraw.amount_usd
+        if withdraw.status not in ['pending', 'processing']:
+            raise ValueError(f"Cannot cancel withdraw with status: {withdraw.status}")
         
+        # Cancel withdraw
+        withdraw.status = 'cancelled'
+        withdraw.reserved_balance = False
         await self.db.commit()
         
-        return True
+        logger.info(f"Withdraw cancelled: ID={withdraw_id} by user {telegram_id}")
+        
+        return {
+            "status": "cancelled",
+            "withdraw_id": withdraw_id,
+            "amount_returned": float(withdraw.amount_usd)
+        }

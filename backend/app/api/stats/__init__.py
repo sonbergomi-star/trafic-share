@@ -1,106 +1,169 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
-from datetime import datetime, timedelta, date
-from pydantic import BaseModel
+from datetime import date, timedelta
+import logging
 
 from app.core.database import get_db
-from app.models.pricing import TrafficLog
-from app.models.session import Session
+from app.middleware.auth import get_current_user
+from app.models.user import User
+from app.services.analytics_service import AnalyticsService
 
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
 
-@router.get("/daily/{telegram_id}")
-async def get_daily_stats(telegram_id: int, db: AsyncSession = Depends(get_db)):
+@router.get("/")
+async def get_statistics(
+    period: str = Query("week", regex="^(today|week|month|year)$"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
     """
-    Get daily statistics
+    REAL statistics calculation from database
     """
-    today = date.today()
+    analytics_service = AnalyticsService(db)
     
-    # Get today's traffic logs
-    result = await db.execute(
-        select(TrafficLog)
-        .where(TrafficLog.telegram_id == telegram_id)
-        .where(TrafficLog.date == today)
-        .where(TrafficLog.period == 'daily')
-    )
-    log = result.scalar_one_or_none()
-    
-    if not log:
+    try:
+        stats = await analytics_service.get_user_analytics(
+            telegram_id=current_user.telegram_id,
+            period=period
+        )
+        
         return {
-            "date": today.isoformat(),
-            "sent_mb": 0.0,
-            "sold_mb": 0.0,
-            "profit_usd": 0.0,
-            "price_per_mb": 0.0,
+            "status": "success",
+            "data": stats
         }
     
-    return {
-        "date": log.date.isoformat(),
-        "sent_mb": log.sent_mb,
-        "sold_mb": log.sold_mb,
-        "profit_usd": log.profit_usd,
-        "price_per_mb": log.price_per_mb,
-    }
+    except Exception as e:
+        logger.error(f"Failed to get statistics: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve statistics")
 
 
-@router.get("/weekly/{telegram_id}")
-async def get_weekly_stats(telegram_id: int, db: AsyncSession = Depends(get_db)):
+@router.get("/summary")
+async def get_statistics_summary(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
     """
-    Get weekly statistics
+    REAL quick statistics summary
     """
-    today = date.today()
-    week_ago = today - timedelta(days=7)
+    analytics_service = AnalyticsService(db)
     
-    result = await db.execute(
-        select(
-            func.sum(TrafficLog.sent_mb).label('total_sent'),
-            func.sum(TrafficLog.sold_mb).label('total_sold'),
-            func.sum(TrafficLog.profit_usd).label('total_profit'),
-            func.avg(TrafficLog.price_per_mb).label('avg_price'),
+    try:
+        # Get today, week, and month stats in parallel
+        today_stats = await analytics_service.get_user_analytics(current_user.telegram_id, "today")
+        week_stats = await analytics_service.get_user_analytics(current_user.telegram_id, "week")
+        month_stats = await analytics_service.get_user_analytics(current_user.telegram_id, "month")
+        
+        return {
+            "status": "success",
+            "data": {
+                "today": {
+                    "sessions": today_stats['summary']['total_sessions'],
+                    "earned": today_stats['summary']['total_earned_usd'],
+                    "traffic_mb": today_stats['summary']['total_sent_mb'],
+                },
+                "week": {
+                    "sessions": week_stats['summary']['total_sessions'],
+                    "earned": week_stats['summary']['total_earned_usd'],
+                    "traffic_mb": week_stats['summary']['total_sent_mb'],
+                },
+                "month": {
+                    "sessions": month_stats['summary']['total_sessions'],
+                    "earned": month_stats['summary']['total_earned_usd'],
+                    "traffic_mb": month_stats['summary']['total_sent_mb'],
+                },
+                "success_rate": week_stats['summary']['success_rate'],
+                "avg_duration": week_stats['summary']['avg_duration'],
+            }
+        }
+    
+    except Exception as e:
+        logger.error(f"Failed to get summary: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve summary")
+
+
+@router.get("/hourly")
+async def get_hourly_distribution(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    REAL hourly distribution of sessions
+    """
+    analytics_service = AnalyticsService(db)
+    
+    try:
+        result = await analytics_service.get_hourly_distribution(
+            telegram_id=current_user.telegram_id
         )
-        .where(TrafficLog.telegram_id == telegram_id)
-        .where(TrafficLog.date >= week_ago)
-        .where(TrafficLog.period == 'daily')
-    )
-    stats = result.one()
+        
+        return {
+            "status": "success",
+            "data": result
+        }
     
-    return {
-        "period": "last_7_days",
-        "sent_mb": float(stats.total_sent or 0.0),
-        "sold_mb": float(stats.total_sold or 0.0),
-        "profit_usd": float(stats.total_profit or 0.0),
-        "avg_price_per_mb": float(stats.avg_price or 0.0),
-    }
+    except Exception as e:
+        logger.error(f"Failed to get hourly distribution: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve hourly distribution")
 
 
-@router.get("/monthly/{telegram_id}")
-async def get_monthly_stats(telegram_id: int, db: AsyncSession = Depends(get_db)):
+@router.get("/trends")
+async def get_traffic_trends(
+    days: int = Query(30, ge=1, le=365),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
     """
-    Get monthly statistics
+    REAL traffic trends over time
     """
-    today = date.today()
-    month_start = date(today.year, today.month, 1)
+    analytics_service = AnalyticsService(db)
     
-    result = await db.execute(
-        select(
-            func.sum(TrafficLog.sent_mb).label('total_sent'),
-            func.sum(TrafficLog.sold_mb).label('total_sold'),
-            func.sum(TrafficLog.profit_usd).label('total_profit'),
-            func.avg(TrafficLog.price_per_mb).label('avg_price'),
+    try:
+        result = await analytics_service.get_traffic_trends(days=days)
+        
+        return {
+            "status": "success",
+            "data": result
+        }
+    
+    except Exception as e:
+        logger.error(f"Failed to get trends: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve trends")
+
+
+@router.get("/report")
+async def generate_report(
+    start_date: date = Query(...),
+    end_date: date = Query(...),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    REAL generate custom date range report
+    """
+    # Validate date range
+    if start_date > end_date:
+        raise HTTPException(status_code=400, detail="Start date must be before end date")
+    
+    if (end_date - start_date).days > 365:
+        raise HTTPException(status_code=400, detail="Date range cannot exceed 365 days")
+    
+    analytics_service = AnalyticsService(db)
+    
+    try:
+        report = await analytics_service.generate_user_report(
+            telegram_id=current_user.telegram_id,
+            start_date=start_date,
+            end_date=end_date
         )
-        .where(TrafficLog.telegram_id == telegram_id)
-        .where(TrafficLog.date >= month_start)
-        .where(TrafficLog.period == 'daily')
-    )
-    stats = result.one()
+        
+        return {
+            "status": "success",
+            "data": report
+        }
     
-    return {
-        "period": f"{today.year}-{today.month:02d}",
-        "sent_mb": float(stats.total_sent or 0.0),
-        "sold_mb": float(stats.total_sold or 0.0),
-        "profit_usd": float(stats.total_profit or 0.0),
-        "avg_price_per_mb": float(stats.avg_price or 0.0),
-    }
+    except Exception as e:
+        logger.error(f"Failed to generate report: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate report")

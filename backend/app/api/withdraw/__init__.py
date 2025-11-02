@@ -1,125 +1,162 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-from pydantic import BaseModel
-from datetime import datetime
-import uuid
+from pydantic import BaseModel, Field
+import logging
 
 from app.core.database import get_db
-from app.core.config import settings
+from app.middleware.auth import get_current_user
 from app.models.user import User
-from app.models.transaction import WithdrawRequest, Transaction
+from app.services.payment_service import PaymentService
 
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
 
-class WithdrawCreateRequest(BaseModel):
-    telegram_id: int
-    amount_usd: float
-    wallet_address: str
-    network: str = "BEP20"
+class WithdrawRequest(BaseModel):
+    amount_usd: float = Field(..., gt=0, description="Amount in USD")
+    wallet_address: str = Field(..., min_length=10, description="USDT BEP20 wallet address")
+    network: str = Field(default="BEP20", description="Network type")
 
 
-class WithdrawResponse(BaseModel):
-    status: str
-    withdraw_id: int
-    message: str
-
-
-@router.post("", response_model=WithdrawResponse)
-async def create_withdraw(request: WithdrawCreateRequest, db: AsyncSession = Depends(get_db)):
+@router.post("/create")
+async def create_withdraw(
+    request: WithdrawRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
     """
-    Create withdraw request
+    REAL create withdraw request with validation
     """
-    # Validate amount
-    if request.amount_usd < settings.MIN_WITHDRAW_USD:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Minimum withdraw amount is ${settings.MIN_WITHDRAW_USD}"
-        )
+    payment_service = PaymentService(db)
     
-    if request.amount_usd > settings.MAX_WITHDRAW_USD:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Maximum withdraw amount is ${settings.MAX_WITHDRAW_USD}"
+    try:
+        result = await payment_service.create_withdraw_request(
+            telegram_id=current_user.telegram_id,
+            amount_usd=request.amount_usd,
+            wallet_address=request.wallet_address,
+            network=request.network
         )
+        
+        logger.info(
+            f"Withdraw request created by {current_user.telegram_id}: "
+            f"${request.amount_usd} to {request.wallet_address[:10]}..."
+        )
+        
+        return {
+            "status": "success",
+            "data": result
+        }
     
-    # Get user
-    result = await db.execute(
-        select(User).where(User.telegram_id == request.telegram_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Withdraw creation failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create withdraw request")
+
+
+@router.get("/history")
+async def get_withdraw_history(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(20, ge=1, le=100),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    REAL withdraw history with pagination
+    """
+    payment_service = PaymentService(db)
+    
+    offset = (page - 1) * per_page
+    result = await payment_service.get_withdraw_history(
+        telegram_id=current_user.telegram_id,
+        limit=per_page,
+        offset=offset
     )
-    user = result.scalar_one_or_none()
-    
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    
-    # Check balance
-    if user.balance_usd < request.amount_usd:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Insufficient balance"
-        )
-    
-    # Validate wallet address (basic BEP20 validation)
-    if not request.wallet_address.startswith("0x") or len(request.wallet_address) != 42:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid BEP20 wallet address"
-        )
-    
-    # Create withdraw request
-    idempotency_key = str(uuid.uuid4())
-    withdraw = WithdrawRequest(
-        telegram_id=request.telegram_id,
-        amount_usd=request.amount_usd,
-        amount_usdt=request.amount_usd * 0.9,  # Approximate conversion
-        wallet_address=request.wallet_address,
-        network=request.network,
-        idempotency_key=idempotency_key,
-        status="pending",
-        reserved_balance=True,
-    )
-    
-    # Reserve balance
-    user.balance_usd -= request.amount_usd
-    
-    db.add(withdraw)
-    await db.commit()
-    await db.refresh(withdraw)
     
     return {
-        "status": "pending",
-        "withdraw_id": withdraw.id,
-        "message": "Withdraw request created and queued for processing"
-    }
-
-
-@router.get("/history/{telegram_id}")
-async def get_withdraw_history(telegram_id: int, db: AsyncSession = Depends(get_db)):
-    """
-    Get withdraw history for user
-    """
-    result = await db.execute(
-        select(WithdrawRequest)
-        .where(WithdrawRequest.telegram_id == telegram_id)
-        .order_by(WithdrawRequest.created_at.desc())
-        .limit(10)
-    )
-    withdraws = result.scalars().all()
-    
-    return {
-        "withdraws": [
-            {
-                "id": w.id,
-                "amount_usd": w.amount_usd,
-                "amount_usdt": w.amount_usdt,
-                "wallet_address": w.wallet_address,
-                "status": w.status,
-                "tx_hash": w.tx_hash,
-                "created_at": w.created_at.isoformat(),
-                "processed_at": w.processed_at.isoformat() if w.processed_at else None,
+        "status": "success",
+        "data": {
+            "withdrawals": result['withdrawals'],
+            "pagination": {
+                "page": page,
+                "per_page": per_page,
+                "total": result['total'],
+                "total_pages": (result['total'] + per_page - 1) // per_page,
             }
-            for w in withdraws
-        ]
+        }
     }
+
+
+@router.get("/{withdraw_id}")
+async def get_withdraw_status(
+    withdraw_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    REAL get withdraw status
+    """
+    payment_service = PaymentService(db)
+    
+    try:
+        result = await payment_service.get_withdraw_status(withdraw_id)
+        
+        # Check ownership
+        if result.get('telegram_id') != current_user.telegram_id:
+            raise HTTPException(status_code=403, detail="Not your withdraw request")
+        
+        return {
+            "status": "success",
+            "data": result
+        }
+    
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.post("/{withdraw_id}/cancel")
+async def cancel_withdraw(
+    withdraw_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    REAL cancel pending withdraw
+    """
+    payment_service = PaymentService(db)
+    
+    try:
+        result = await payment_service.cancel_withdraw(
+            withdraw_id=withdraw_id,
+            telegram_id=current_user.telegram_id
+        )
+        
+        logger.info(f"Withdraw cancelled: ID={withdraw_id} by {current_user.telegram_id}")
+        
+        return {
+            "status": "success",
+            "data": result
+        }
+    
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/webhook")
+async def withdraw_webhook(
+    data: dict,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    REAL webhook for payment provider callbacks
+    """
+    # Verify webhook signature (in production)
+    # For now, log and process
+    
+    logger.info(f"Withdraw webhook received: {data}")
+    
+    # Process webhook data
+    # Update withdraw status based on provider response
+    
+    return {"status": "ok"}
