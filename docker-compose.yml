@@ -1,0 +1,65 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: traffic-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: traffic
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    container_name: traffic-redis
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+
+  backend:
+    build:
+      context: ./backend
+    container_name: traffic-backend
+    restart: unless-stopped
+    env_file:
+      - backend/.env.example
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/traffic
+      DATABASE_URL_SYNC: postgresql+psycopg://postgres:postgres@db:5432/traffic
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    depends_on:
+      - db
+      - redis
+    ports:
+      - "8000:8000"
+
+  worker:
+    build:
+      context: ./backend
+    container_name: traffic-worker
+    restart: unless-stopped
+    command: ["celery", "-A", "app.core.celery_app:celery_app", "worker", "-l", "info"]
+    env_file:
+      - backend/.env.example
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/traffic
+      DATABASE_URL_SYNC: postgresql+psycopg://postgres:postgres@db:5432/traffic
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    depends_on:
+      - db
+      - redis
+
+volumes:
+  db_data:
+  redis_data:
