@@ -1,0 +1,66 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Android
+*.apk
+*.ap_
+*.aab
+.gradle/
+local.properties
+*.iml
+.idea/
+*.keystore
+!debug.keystore
+build/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Firebase
+google-services.json
+google-services.json.backup
+
+# Node (if any)
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Deployment
+*.pem
+*.key
+*.crt

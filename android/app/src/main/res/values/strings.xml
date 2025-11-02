@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Traffic Sharing</string>
+    
+    <!-- Auth -->
+    <string name="login_with_telegram">Telegram orqali kirish</string>
+    <string name="terms_of_service">Foydalanish shartlari</string>
+    <string name="privacy_policy">Maxfiylik siyosati</string>
+    
+    <!-- Dashboard -->
+    <string name="dashboard">Dashboard</string>
+    <string name="balance">Balans</string>
+    <string name="traffic">Trafik</string>
+    <string name="start">START</string>
+    <string name="stop">STOP</string>
+    <string name="withdraw">YECHISH</string>
+    
+    <!-- Balance -->
+    <string name="current_balance">Joriy balans</string>
+    <string name="sent_traffic">Yuborilgan trafik</string>
+    <string name="used_traffic">Ishlatilgan trafik</string>
+    <string name="refresh">Yangi</string>
+    
+    <!-- Statistics -->
+    <string name="statistics">Statistika</string>
+    <string name="daily">Kunlik</string>
+    <string name="weekly">Haftalik</string>
+    <string name="monthly">Oylik</string>
+    
+    <!-- Settings -->
+    <string name="settings">Sozlamalar</string>
+    <string name="language">Til</string>
+    <string name="notifications">Bildirishnomalar</string>
+    <string name="logout">Chiqish</string>
+    
+    <!-- Profile -->
+    <string name="profile">Profil</string>
+    <string name="security">Xavfsizlik</string>
+    
+    <!-- Support -->
+    <string name="support">Qo\'llab-quvvatlash</string>
+    <string name="send_message">Xabar yuborish</string>
+    
+    <!-- News -->
+    <string name="news">Yangiliklar</string>
+    <string name="promo_codes">Promo-kodlar</string>
+    
+    <!-- Common -->
+    <string name="loading">Yuklanmoqda...</string>
+    <string name="error">Xatolik yuz berdi</string>
+    <string name="retry">Qayta urinish</string>
+    <string name="success">Muvaffaqiyatli</string>
+</resources>
