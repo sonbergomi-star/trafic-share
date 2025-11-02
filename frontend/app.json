@@ -1,0 +1,38 @@
+{
+  "expo": {
+    "name": "Traffic Sharing",
+    "slug": "traffic-sharing",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0b0e1a"
+    },
+    "updates": {
+      "fallbackToCacheTimeout": 0
+    },
+    "assetBundlePatterns": ["**/*"],
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0b0e1a"
+      },
+      "package": "com.traffic.sharing"
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "traffic-sharing-project"
+      },
+      "apiUrl": "https://113.30.191.89/api",
+      "telegramBot": "your_bot_username"
+    }
+  }
+}
